@@ -1,0 +1,11 @@
+[functions.transcribe]
+verify_jwt = true
+entrypoint = "./functions/transcribe/index.ts"
+
+[functions.translate]
+verify_jwt = true
+entrypoint = "./functions/translate/index.ts"
+
+[functions.tts]
+verify_jwt = true
+entrypoint = "./functions/tts/index.ts"

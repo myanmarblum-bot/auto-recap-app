@@ -1,0 +1,77 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: dark;
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+body {
+  @apply bg-neutral-950 text-neutral-100 font-sans antialiased;
+}
+
+/* Custom scrollbar */
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-track {
+  @apply bg-neutral-900;
+}
+::-webkit-scrollbar-thumb {
+  @apply bg-neutral-700 rounded-full;
+}
+::-webkit-scrollbar-thumb:hover {
+  @apply bg-neutral-600;
+}
+
+/* Selection color */
+::selection {
+  @apply bg-primary-500/30 text-primary-100;
+}
+
+@layer components {
+  .glass-panel {
+    @apply bg-neutral-900/60 backdrop-blur-xl border border-neutral-800 rounded-2xl;
+  }
+
+  .btn-primary {
+    @apply inline-flex items-center justify-center gap-2 px-5 py-2.5 rounded-xl font-medium text-sm
+      bg-primary-600 hover:bg-primary-500 active:bg-primary-700
+      text-white transition-all duration-200 shadow-lg shadow-primary-900/30
+      disabled:opacity-40 disabled:cursor-not-allowed disabled:shadow-none;
+  }
+
+  .btn-secondary {
+    @apply inline-flex items-center justify-center gap-2 px-5 py-2.5 rounded-xl font-medium text-sm
+      bg-neutral-800 hover:bg-neutral-750 active:bg-neutral-700
+      text-neutral-100 border border-neutral-700 transition-all duration-200
+      disabled:opacity-40 disabled:cursor-not-allowed;
+  }
+
+  .btn-ghost {
+    @apply inline-flex items-center justify-center gap-2 px-3 py-2 rounded-lg font-medium text-sm
+      text-neutral-400 hover:text-neutral-100 hover:bg-neutral-800 transition-all duration-200;
+  }
+
+  .btn-accent {
+    @apply inline-flex items-center justify-center gap-2 px-5 py-2.5 rounded-xl font-medium text-sm
+      bg-accent-500 hover:bg-accent-400 active:bg-accent-600
+      text-neutral-950 transition-all duration-200 shadow-lg shadow-accent-900/30
+      disabled:opacity-40 disabled:cursor-not-allowed;
+  }
+}
+
+.step-dot {
+  @apply w-2.5 h-2.5 rounded-full transition-all duration-300;
+}
+
+.progress-bar-fill {
+  @apply h-full rounded-full transition-all duration-300 ease-out;
+}
