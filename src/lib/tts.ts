@@ -46,31 +46,6 @@ export function stopSpeaking(): void {
   }
 }
 
-const VOICE_OPTIONS_FOR_BURMESE: VoiceOption[] = [
-  {
-    id: 'thiri',
-    name: 'Thiri',
-    gender: 'female',
-    language: 'Myanmar (Burmese)',
-    languageCode: 'my-MM',
-    description: 'Warm, clear Burmese narrator',
-    pitch: 1.05,
-    rate: 0.95,
-    edgeVoice: 'my-MM-NilarNeural',
-  },
-  {
-    id: 'aung',
-    name: 'Aung',
-    gender: 'male',
-    language: 'Myanmar (Burmese)',
-    languageCode: 'my-MM',
-    description: 'Calm, articulate Burmese voice',
-    pitch: 0.9,
-    rate: 1.0,
-    edgeVoice: 'my-MM-ThihaNeural',
-  },
-];
-
 const MAX_RETRIES = 3;
 const RETRY_DELAY_MS = 1000;
 
@@ -98,6 +73,7 @@ async function callEdgeTTS(
       text,
       voice: voice.edgeVoice,
       speed: opts?.speed ?? voice.rate,
+      pitch: voice.pitch,
       volume: opts?.volume ?? 1,
     }),
   });
@@ -231,11 +207,15 @@ export async function generateTTSSegments(
   const combinedText = validSegments.map((s) => s.translatedText ?? s.text).join(' ');
   const detectedLanguage = detectLanguage(combinedText);
 
-  let effectiveVoice = voice;
-  if (detectedLanguage === 'my') {
-    effectiveVoice =
-      VOICE_OPTIONS_FOR_BURMESE.find((v) => v.gender === voice.gender) ??
-      VOICE_OPTIONS_FOR_BURMESE[0];
+  // Use the user's selected voice directly — never override it.
+  // If the text language doesn't match the voice language, warn but proceed.
+  const effectiveVoice = voice;
+  const voiceLangPrefix = effectiveVoice.languageCode.slice(0, 2).toLowerCase();
+  if (detectedLanguage !== 'en' && voiceLangPrefix !== detectedLanguage) {
+    console.warn(
+      `[TTS] Language mismatch: text is ${detectedLanguage}, voice is ${effectiveVoice.languageCode}. ` +
+      `The selected voice may not pronounce the text correctly.`
+    );
   }
 
   const failedSegments: { segmentId: string; text: string; error: string }[] = [];
@@ -302,17 +282,24 @@ export async function generateTTSSegments(
 
   const totalDuration = successfulResults.reduce((sum, r) => sum + r.durationSec, 0);
 
+  const voiceMatched = voiceUsed === effectiveVoice.edgeVoice;
+
   const debugInfo: TTSDebugEntry = {
     timestamp: new Date().toISOString(),
     detectedLanguage,
-    selectedVoice: voiceUsed,
+    selectedVoice: effectiveVoice.edgeVoice,
+    actualVoiceUsed: voiceUsed,
+    voiceMatched,
     audioDurationSec: totalDuration,
+    segmentCount: successfulResults.length,
     textPreview: successfulResults[0]?.text.substring(0, 80) ?? '',
   };
 
   console.log('[TTS Debug]', {
     detectedLanguage,
-    selectedVoice: voiceUsed,
+    selectedVoice: effectiveVoice.edgeVoice,
+    actualVoiceUsed: voiceUsed,
+    voiceMatched,
     segmentCount: successfulResults.length,
     failedCount: failedSegments.length,
     totalDuration,

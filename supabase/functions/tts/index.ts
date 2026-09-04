@@ -10,6 +10,7 @@ interface TTSRequest {
   text: string;
   voice: string;
   speed?: number;
+  pitch?: number;
   volume?: number;
 }
 
@@ -60,7 +61,7 @@ Deno.serve(async (req: Request) => {
     }
 
     const body: TTSRequest = await req.json();
-    const { text, voice, speed, volume } = body;
+    const { text, voice, speed, pitch, volume } = body;
 
     if (!text || typeof text !== "string" || text.trim().length === 0) {
       return new Response(
@@ -78,24 +79,24 @@ Deno.serve(async (req: Request) => {
 
     const detectedLang = detectLanguage(text);
 
-    // If text is Burmese, force Myanmar neural voice — never fall back to English
-    let effectiveVoice = voice;
-    if (detectedLang === "my") {
-      const isFemale = voice.toLowerCase().includes("nilar") ||
-        (!voice.toLowerCase().includes("thiha") && !voice.toLowerCase().includes("male"));
-      effectiveVoice = isFemale ? "my-MM-NilarNeural" : "my-MM-ThihaNeural";
-    }
+    // Use the voice passed by the client directly — never override it.
+    // The client is responsible for selecting the correct voice for the language.
+    const effectiveVoice = voice;
+
+    console.log(`[TTS] requestedVoice=${voice} effectiveVoice=${effectiveVoice} lang=${detectedLang}`);
 
     const rate = speed ?? 1.0;
     const vol = volume ?? 1.0;
+    const pitchHz = pitch ?? 1.0;
 
     const ratePercent = `${rate >= 1 ? "+" : ""}${Math.round((rate - 1) * 100)}%`;
     const volPercent = `${vol >= 1 ? "+" : ""}${Math.round((vol - 1) * 100)}%`;
+    const pitchStr = `${pitchHz >= 1 ? "+" : ""}${Math.round((pitchHz - 1) * 50)}Hz`;
 
     const ssml =
       `<speak version='1.0' xmlns='http://www.w3.org/2001/10/synthesis' xml:lang='en-US'>` +
       `<voice name='${effectiveVoice}'>` +
-      `<prosody pitch='+0Hz' rate='${ratePercent}' volume='${volPercent}'>` +
+      `<prosody pitch='${pitchStr}' rate='${ratePercent}' volume='${volPercent}'>` +
       escapeXml(text) +
       `</prosody>` +
       `</voice>` +

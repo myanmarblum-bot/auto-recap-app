@@ -22,7 +22,10 @@ export interface TTSDebugEntry {
   timestamp: string;
   detectedLanguage: string;
   selectedVoice: string;
+  actualVoiceUsed: string;
+  voiceMatched: boolean;
   audioDurationSec: number;
+  segmentCount: number;
   textPreview: string;
 }
 

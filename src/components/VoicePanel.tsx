@@ -109,6 +109,72 @@ export function VoicePanel({
     }
   };
 
+  const renderVoiceCard = (voice: VoiceOption) => {
+    const isSelected = voice.id === selectedVoiceId;
+    const isPlaying = playingId === voice.id;
+    const isLanguageMatch = langPrefix(voice.languageCode) === targetPrefix;
+    return (
+      <div
+        key={voice.id}
+        onClick={() => onSelectVoice(voice.id)}
+        className={cn(
+          'group cursor-pointer rounded-xl border p-3 transition-all duration-200',
+          isSelected
+            ? 'border-primary-500 bg-primary-500/5 ring-1 ring-primary-500/30'
+            : 'border-neutral-800 bg-neutral-900/40 hover:border-neutral-700 hover:bg-neutral-900/70'
+        )}
+      >
+        <div className="flex items-center justify-between gap-2">
+          <div className="flex items-center gap-2.5 min-w-0">
+            <div
+              className={cn(
+                'flex h-9 w-9 shrink-0 items-center justify-center rounded-lg transition-colors',
+                voice.gender === 'female'
+                  ? 'bg-pink-500/10 text-pink-400'
+                  : 'bg-blue-500/10 text-blue-400'
+              )}
+            >
+              <Mic2 className="h-4 w-4" />
+            </div>
+            <div className="min-w-0">
+              <div className="flex items-center gap-1.5">
+                <p className="text-sm font-medium text-neutral-100 truncate">{voice.name}</p>
+                {isLanguageMatch && (
+                  <Star className="h-3 w-3 shrink-0 text-accent-400 fill-accent-400" />
+                )}
+              </div>
+              <p className="text-[11px] text-neutral-400 truncate">{voice.language}</p>
+            </div>
+          </div>
+          <button
+            onClick={(e) => {
+              e.stopPropagation();
+              togglePreview(voice.id);
+            }}
+            disabled={isPlaying}
+            className={cn(
+              'flex h-8 w-8 shrink-0 items-center justify-center rounded-lg transition-colors',
+              isPlaying
+                ? 'bg-primary-500 text-white'
+                : 'bg-neutral-800 text-neutral-400 hover:text-neutral-100 hover:bg-neutral-700'
+            )}
+            aria-label={isPlaying ? 'Stop preview' : 'Preview voice'}
+          >
+            {isPlaying ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Play className="h-3.5 w-3.5 ml-0.5" />}
+          </button>
+        </div>
+        <p className="mt-2 text-[11px] text-neutral-500">{voice.description}</p>
+        <p className="mt-1 text-[10px] text-neutral-600 font-mono">{voice.edgeVoice}</p>
+        {isSelected && (
+          <div className="mt-2 flex items-center gap-1 text-[11px] font-medium text-primary-300">
+            <Check className="h-3 w-3" />
+            Selected
+          </div>
+        )}
+      </div>
+    );
+  };
+
   if (!isReady && !isCompleted) {
     return (
       <div className="glass-panel p-5 animate-slide-up">
@@ -200,79 +266,34 @@ export function VoicePanel({
                       : 'bg-neutral-800 text-neutral-400 hover:text-neutral-200 hover:bg-neutral-750'
                   )}
                 >
-                  {g === 'all' ? 'All' : g}
+                  {g === 'all' ? 'All Voices' : g === 'female' ? 'Female Voices' : 'Male Voices'}
                 </button>
               ))}
             </div>
 
-            {/* Voice grid */}
-            <div className="grid grid-cols-1 gap-2.5 sm:grid-cols-2 max-h-[260px] overflow-y-auto pr-1">
-              {visibleVoices.map((voice) => {
-                const isSelected = voice.id === selectedVoiceId;
-                const isPlaying = playingId === voice.id;
-                const isLanguageMatch = langPrefix(voice.languageCode) === targetPrefix;
-                return (
-                  <div
-                    key={voice.id}
-                    onClick={() => onSelectVoice(voice.id)}
-                    className={cn(
-                      'group cursor-pointer rounded-xl border p-3 transition-all duration-200',
-                      isSelected
-                        ? 'border-primary-500 bg-primary-500/5 ring-1 ring-primary-500/30'
-                        : 'border-neutral-800 bg-neutral-900/40 hover:border-neutral-700 hover:bg-neutral-900/70'
-                    )}
-                  >
-                    <div className="flex items-center justify-between gap-2">
-                      <div className="flex items-center gap-2.5 min-w-0">
-                        <div
-                          className={cn(
-                            'flex h-9 w-9 shrink-0 items-center justify-center rounded-lg transition-colors',
-                            voice.gender === 'female'
-                              ? 'bg-pink-500/10 text-pink-400'
-                              : 'bg-blue-500/10 text-blue-400'
-                          )}
-                        >
-                          <Mic2 className="h-4 w-4" />
-                        </div>
-                        <div className="min-w-0">
-                          <div className="flex items-center gap-1.5">
-                            <p className="text-sm font-medium text-neutral-100 truncate">{voice.name}</p>
-                            {isLanguageMatch && (
-                              <Star className="h-3 w-3 shrink-0 text-accent-400 fill-accent-400" />
-                            )}
-                          </div>
-                          <p className="text-[11px] text-neutral-400 truncate">{voice.language}</p>
-                        </div>
+            {/* Voice grid — grouped by category */}
+            {genderFilter === 'all' ? (
+              <div className="space-y-4 max-h-[260px] overflow-y-auto pr-1">
+                {(['female', 'male'] as const).map((gender) => {
+                  const genderVoices = visibleVoices.filter((v) => v.gender === gender);
+                  if (genderVoices.length === 0) return null;
+                  return (
+                    <div key={gender}>
+                      <p className="mb-2 text-[11px] font-semibold uppercase tracking-wider text-neutral-500">
+                        {gender === 'female' ? 'Female Voices' : 'Male Voices'}
+                      </p>
+                      <div className="grid grid-cols-1 gap-2.5 sm:grid-cols-2">
+                        {genderVoices.map((voice) => renderVoiceCard(voice))}
                       </div>
-                      <button
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          togglePreview(voice.id);
-                        }}
-                        disabled={isPlaying}
-                        className={cn(
-                          'flex h-8 w-8 shrink-0 items-center justify-center rounded-lg transition-colors',
-                          isPlaying
-                            ? 'bg-primary-500 text-white'
-                            : 'bg-neutral-800 text-neutral-400 hover:text-neutral-100 hover:bg-neutral-700'
-                        )}
-                        aria-label={isPlaying ? 'Stop preview' : 'Preview voice'}
-                      >
-                        {isPlaying ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Play className="h-3.5 w-3.5 ml-0.5" />}
-                      </button>
                     </div>
-                    <p className="mt-2 text-[11px] text-neutral-500">{voice.description}</p>
-                    <p className="mt-1 text-[10px] text-neutral-600 font-mono">{voice.edgeVoice}</p>
-                    {isSelected && (
-                      <div className="mt-2 flex items-center gap-1 text-[11px] font-medium text-primary-300">
-                        <Check className="h-3 w-3" />
-                        Selected
-                      </div>
-                    )}
-                  </div>
-                );
-              })}
-            </div>
+                  );
+                })}
+              </div>
+            ) : (
+              <div className="grid grid-cols-1 gap-2.5 sm:grid-cols-2 max-h-[260px] overflow-y-auto pr-1">
+                {visibleVoices.map((voice) => renderVoiceCard(voice))}
+              </div>
+            )}
 
             {previewError && (
               <div className="mt-3 flex items-start gap-2 rounded-lg border border-error-500/30 bg-error-500/10 p-2.5">
@@ -395,7 +416,7 @@ export function VoicePanel({
               <div className="mt-4 w-full rounded-xl border border-neutral-800 bg-neutral-900/60 p-3">
                 <div className="flex items-center gap-2 mb-2">
                   <Info className="h-3.5 w-3.5 text-primary-400" />
-                  <p className="text-xs font-medium text-neutral-300">Debug Log</p>
+                  <p className="text-xs font-medium text-neutral-300">Generation Log</p>
                 </div>
                 <div className="space-y-1 text-[11px] font-mono text-neutral-400">
                   <div className="flex justify-between">
@@ -405,6 +426,17 @@ export function VoicePanel({
                   <div className="flex justify-between">
                     <span className="text-neutral-500">Selected Voice:</span>
                     <span className="text-primary-300">{debugInfo.selectedVoice}</span>
+                  </div>
+                  <div className="flex justify-between">
+                    <span className="text-neutral-500">Actual Voice Used:</span>
+                    <span className={cn(debugInfo.voiceMatched ? 'text-success-300' : 'text-warning-300')}>
+                      {debugInfo.actualVoiceUsed}
+                      {!debugInfo.voiceMatched && ' (mismatch!)'}
+                    </span>
+                  </div>
+                  <div className="flex justify-between">
+                    <span className="text-neutral-500">Segments:</span>
+                    <span className="text-neutral-300">{debugInfo.segmentCount}</span>
                   </div>
                   <div className="flex justify-between">
                     <span className="text-neutral-500">Audio Duration:</span>
