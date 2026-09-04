@@ -15,6 +15,22 @@ import { removeVocals, exportFinalVideo } from '@/lib/voiceRemoval';
 import { syncTTSimeline } from '@/lib/sync';
 import { VOICE_OPTIONS } from '@/lib/constants';
 
+async function getVideoDurationSec(videoUrl: string | null): Promise<number> {
+  if (!videoUrl) return 0;
+  return new Promise((resolve) => {
+    const v = document.createElement('video');
+    v.preload = 'metadata';
+    v.src = videoUrl;
+    v.addEventListener('loadedmetadata', () => {
+      const dur = v.duration;
+      v.removeAttribute('src');
+      resolve(dur && isFinite(dur) ? dur : 0);
+    }, { once: true });
+    v.addEventListener('error', () => resolve(0), { once: true });
+    setTimeout(() => resolve(0), 5000);
+  });
+}
+
 export default function App() {
   const wf = useWorkflow();
   const { state } = wf;
@@ -123,6 +139,15 @@ export default function App() {
       if (result.debugInfo) {
         wf.setTTSDebugInfo(result.debugInfo);
       }
+
+      if (result.failedSegments.length > 0) {
+        const msg = `${result.failedSegments.length} of ${state.translatedTranscript.length} segments failed to generate voice. ` +
+          `The video will use ${result.segments.length} segments. You can try regenerating to attempt the failed ones.`;
+        wf.setError(msg);
+      } else {
+        wf.setError(null);
+      }
+
       wf.setStepStatus('tts', 'completed', 100);
       wf.advanceTo('sync');
     } catch (err) {
@@ -142,9 +167,14 @@ export default function App() {
     wf.setError(null);
 
     try {
-      // Use the last segment's end time as total duration, or the video duration
+      // Get the actual video duration by loading metadata — this is the
+      // authoritative total duration for the synced audio, NOT the last
+      // transcript timestamp (which may be shorter than the video).
+      const videoDuration = await getVideoDurationSec(state.videoUrl);
       const lastSeg = state.translatedTranscript[state.translatedTranscript.length - 1];
-      const totalDuration = lastSeg?.end ?? 0;
+      const totalDuration = Math.max(videoDuration, lastSeg?.end ?? 0);
+
+      console.log('[Sync] Total duration for sync:', totalDuration, '(video:', videoDuration, ', last seg end:', lastSeg?.end ?? 0, ')');
 
       const result = await syncTTSimeline({
         segments: state.ttsSegments,

@@ -71,6 +71,13 @@ const VOICE_OPTIONS_FOR_BURMESE: VoiceOption[] = [
   },
 ];
 
+const MAX_RETRIES = 3;
+const RETRY_DELAY_MS = 1000;
+
+async function sleep(ms: number): Promise<void> {
+  await new Promise((r) => setTimeout(r, ms));
+}
+
 async function callEdgeTTS(
   text: string,
   voice: VoiceOption,
@@ -110,7 +117,36 @@ async function callEdgeTTS(
   const voiceUsed = response.headers.get('X-Voice-Used') || voice.edgeVoice;
 
   const buffer = await response.arrayBuffer();
+
+  if (buffer.byteLength === 0) {
+    throw new Error('TTS service returned empty audio data.');
+  }
+
   return { buffer, detectedLanguage, voiceUsed };
+}
+
+/**
+ * Calls Edge TTS with retry logic. Retries up to MAX_RETRIES times
+ * with exponential backoff. This prevents single-segment failures
+ * from dropping entire transcript segments.
+ */
+async function callEdgeTTSWithRetry(
+  text: string,
+  voice: VoiceOption,
+  opts?: TTSOptions,
+  attempt = 1
+): Promise<{ buffer: ArrayBuffer; detectedLanguage: string; voiceUsed: string }> {
+  try {
+    return await callEdgeTTS(text, voice, opts);
+  } catch (err) {
+    if (attempt >= MAX_RETRIES) {
+      throw err;
+    }
+    const delay = RETRY_DELAY_MS * Math.pow(2, attempt - 1);
+    console.warn(`[TTS] Retry ${attempt}/${MAX_RETRIES} after ${delay}ms:`, err instanceof Error ? err.message : err);
+    await sleep(delay);
+    return callEdgeTTSWithRetry(text, voice, opts, attempt + 1);
+  }
 }
 
 export async function speakPreview(
@@ -162,12 +198,20 @@ export interface TTSGenerationResult {
   detectedLanguage: string;
   voiceUsed: string;
   debugInfo: TTSDebugEntry;
+  failedSegments: { segmentId: string; text: string; error: string }[];
 }
+
+// Concurrency limit for parallel TTS calls
+const CONCURRENCY = 3;
 
 /**
  * Generates TTS audio for each transcript segment individually.
  * Each segment gets its own audio buffer — NOT concatenated.
  * The sync step will place them on the timeline using transcript timestamps.
+ *
+ * Uses bounded concurrency (3 parallel requests) and per-segment retry
+ * to ensure every segment gets audio. Failed segments are collected
+ * and reported, not silently dropped.
  */
 export async function generateTTSSegments(
   segments: TranscriptSegment[],
@@ -194,54 +238,92 @@ export async function generateTTSSegments(
       VOICE_OPTIONS_FOR_BURMESE[0];
   }
 
-  const results: TTSSegmentResult[] = [];
+  const failedSegments: { segmentId: string; text: string; error: string }[] = [];
+  const results: TTSSegmentResult[] = new Array(validSegments.length);
   let voiceUsed = effectiveVoice.edgeVoice;
+  let completedCount = 0;
 
-  for (let i = 0; i < validSegments.length; i++) {
-    const seg = validSegments[i];
-    const text = seg.translatedText ?? seg.text;
+  // Process segments with bounded concurrency
+  for (let i = 0; i < validSegments.length; i += CONCURRENCY) {
+    const batch = validSegments.slice(i, i + CONCURRENCY);
+    const batchIndices = batch.map((_, j) => i + j);
 
-    const { buffer, voiceUsed: vv } = await callEdgeTTS(text, effectiveVoice, opts);
-    voiceUsed = vv;
+    const batchResults = await Promise.allSettled(
+      batch.map(async (seg) => {
+        const text = seg.translatedText ?? seg.text;
+        const { buffer, voiceUsed: vv } = await callEdgeTTSWithRetry(text, effectiveVoice, opts);
+        voiceUsed = vv;
 
-    const blob = new Blob([buffer], { type: 'audio/mpeg' });
-    const audioUrl = URL.createObjectURL(blob);
-    const durationSec = await getAudioDuration(audioUrl);
+        const blob = new Blob([buffer], { type: 'audio/mpeg' });
+        const audioUrl = URL.createObjectURL(blob);
+        const durationSec = await getAudioDuration(audioUrl);
 
-    results.push({
-      segmentId: seg.id,
-      start: seg.start,
-      end: seg.end,
-      text,
-      audioBuffer: buffer,
-      audioUrl,
-      durationSec,
+        return {
+          segmentId: seg.id,
+          start: seg.start,
+          end: seg.end,
+          text,
+          audioBuffer: buffer,
+          audioUrl,
+          durationSec,
+        };
+      })
+    );
+
+    batchResults.forEach((result, j) => {
+      const idx = batchIndices[j];
+      if (result.status === 'fulfilled') {
+        results[idx] = result.value;
+      } else {
+        const seg = batch[j];
+        const errorMsg = result.reason instanceof Error ? result.reason.message : 'Unknown error';
+        console.error(`[TTS] Segment ${seg.id} failed after ${MAX_RETRIES} retries:`, errorMsg);
+        failedSegments.push({
+          segmentId: seg.id,
+          text: (seg.translatedText ?? seg.text).substring(0, 80),
+          error: errorMsg,
+        });
+      }
+      completedCount++;
+      if (onProgress) {
+        onProgress(Math.round((completedCount / validSegments.length) * 100));
+      }
     });
-
-    if (onProgress) {
-      onProgress(Math.round(((i + 1) / validSegments.length) * 100));
-    }
   }
 
-  const totalDuration = results.reduce((sum, r) => sum + r.durationSec, 0);
+  // Filter out any null slots from failed segments
+  const successfulResults = results.filter((r): r is TTSSegmentResult => r !== null);
+
+  if (successfulResults.length === 0) {
+    throw new Error(
+      `All ${validSegments.length} segments failed to generate. Last error: ${failedSegments[0]?.error ?? 'unknown'}`
+    );
+  }
+
+  const totalDuration = successfulResults.reduce((sum, r) => sum + r.durationSec, 0);
 
   const debugInfo: TTSDebugEntry = {
     timestamp: new Date().toISOString(),
     detectedLanguage,
     selectedVoice: voiceUsed,
     audioDurationSec: totalDuration,
-    textPreview: results[0]?.text.substring(0, 80) ?? '',
+    textPreview: successfulResults[0]?.text.substring(0, 80) ?? '',
   };
 
   console.log('[TTS Debug]', {
     detectedLanguage,
     selectedVoice: voiceUsed,
-    segmentCount: results.length,
+    segmentCount: successfulResults.length,
+    failedCount: failedSegments.length,
     totalDuration,
-    textPreview: results[0]?.text.substring(0, 100),
+    textPreview: successfulResults[0]?.text.substring(0, 100),
   });
 
-  return { segments: results, detectedLanguage, voiceUsed, debugInfo };
+  if (failedSegments.length > 0) {
+    console.warn(`[TTS] ${failedSegments.length}/${validSegments.length} segments failed:`, failedSegments);
+  }
+
+  return { segments: successfulResults, detectedLanguage, voiceUsed, debugInfo, failedSegments };
 }
 
 /**
@@ -295,5 +377,7 @@ function getAudioDuration(url: string): Promise<number> {
       resolve(audio.duration || 0);
     });
     audio.addEventListener('error', () => resolve(0));
+    // Safety timeout — some blobs don't fire loadedmetadata
+    setTimeout(() => resolve(0), 5000);
   });
 }

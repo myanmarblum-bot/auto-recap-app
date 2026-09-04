@@ -5,8 +5,12 @@
  * Silence fills the gaps between segments, preserving the original
  * speech timing exactly like SRT subtitles.
  *
+ * If a TTS segment's audio is longer than the gap until the next
+ * segment, it is speed-adjusted (playbackRate) to fit within its
+ * time slot, preventing overlap with subsequent segments.
+ *
  * Uses the Web Audio API (OfflineAudioContext) to render the full
- * timeline as a single audio buffer, then encodes it to a blob.
+ * timeline as a single audio buffer, then encodes it to a WAV blob.
  */
 
 import type { TTSSegmentResult } from './tts';
@@ -21,13 +25,21 @@ export interface SyncResult {
   audioUrl: string;
   blob: Blob;
   durationSec: number;
-  segmentPlacements: { segmentId: string; start: number; end: number; ttsDuration: number }[];
+  segmentPlacements: {
+    segmentId: string;
+    start: number;
+    end: number;
+    ttsDuration: number;
+    playbackRate: number;
+    adjusted: boolean;
+  }[];
 }
 
 /**
  * Renders all TTS segments onto a timeline using OfflineAudioContext.
  * Each segment is placed at its transcript start time.
- * Silence fills the gaps between segments.
+ * Segments that are too long for their time slot are speed-adjusted
+ * to fit, preventing overlap with the next segment.
  */
 export async function syncTTSimeline(opts: SyncOptions): Promise<SyncResult> {
   const { segments, totalDurationSec, onProgress } = opts;
@@ -36,11 +48,23 @@ export async function syncTTSimeline(opts: SyncOptions): Promise<SyncResult> {
     throw new Error('No TTS segments to synchronize.');
   }
 
+  // Sort segments by start time to ensure correct ordering
+  const sortedSegments = [...segments].sort((a, b) => a.start - b.start);
+
   onProgress?.(5);
 
   const sampleRate = 44100;
   const numChannels = 2;
-  const lengthInSamples = Math.ceil(totalDurationSec * sampleRate);
+  // Use the provided total duration (video duration), or fall back to
+  // the last segment's end time + a small buffer
+  const lastSeg = sortedSegments[sortedSegments.length - 1];
+  const lastSegEndsAt = lastSeg ? lastSeg.start + lastSeg.durationSec : 0;
+  const effectiveDuration = Math.max(
+    totalDurationSec,
+    lastSeg?.end ?? 0,
+    lastSegEndsAt
+  );
+  const lengthInSamples = Math.ceil(effectiveDuration * sampleRate);
 
   const OfflineAudioContextClass =
     window.OfflineAudioContext ||
@@ -50,9 +74,9 @@ export async function syncTTSimeline(opts: SyncOptions): Promise<SyncResult> {
 
   const placements: SyncResult['segmentPlacements'] = [];
 
-  for (let i = 0; i < segments.length; i++) {
-    const seg = segments[i];
-    onProgress?.(5 + Math.round(((i + 1) / segments.length) * 60));
+  for (let i = 0; i < sortedSegments.length; i++) {
+    const seg = sortedSegments[i];
+    onProgress?.(5 + Math.round(((i + 1) / sortedSegments.length) * 60));
 
     // Decode the MP3 buffer into an AudioBuffer
     let audioBuffer: AudioBuffer;
@@ -63,21 +87,46 @@ export async function syncTTSimeline(opts: SyncOptions): Promise<SyncResult> {
       continue;
     }
 
-    // Place this segment at its exact transcript start time
     const offsetSec = seg.start;
     const ttsDuration = audioBuffer.duration;
+
+    // Calculate the available time slot: from this segment's start
+    // to the next segment's start (or end of video)
+    const nextSegmentStart = i < sortedSegments.length - 1
+      ? sortedSegments[i + 1].start
+      : effectiveDuration;
+    const availableSlot = nextSegmentStart - offsetSec;
+
+    // If TTS audio is longer than the available slot, speed it up to fit
+    let playbackRate = 1.0;
+    let adjusted = false;
+    let effectiveEnd = offsetSec + ttsDuration;
+
+    if (ttsDuration > availableSlot && availableSlot > 0.1) {
+      // Speed up to fit the audio into the available slot
+      // Add a tiny gap (0.1s) so segments don't butt up perfectly
+      const targetDuration = availableSlot - 0.1;
+      playbackRate = ttsDuration / targetDuration;
+      // Clamp playback rate to a reasonable range (max 2x speed)
+      playbackRate = Math.min(playbackRate, 2.0);
+      adjusted = true;
+      effectiveEnd = offsetSec + (ttsDuration / playbackRate);
+    }
 
     // Create a buffer source and schedule it at the segment's start time
     const source = offlineCtx.createBufferSource();
     source.buffer = audioBuffer;
+    source.playbackRate.value = playbackRate;
     source.connect(offlineCtx.destination);
     source.start(offsetSec);
 
     placements.push({
       segmentId: seg.segmentId,
       start: offsetSec,
-      end: offsetSec + ttsDuration,
+      end: effectiveEnd,
       ttsDuration,
+      playbackRate,
+      adjusted,
     });
   }
 
@@ -93,6 +142,20 @@ export async function syncTTSimeline(opts: SyncOptions): Promise<SyncResult> {
   const audioUrl = URL.createObjectURL(blob);
 
   onProgress?.(100);
+
+  const adjustedCount = placements.filter((p) => p.adjusted).length;
+  console.log('[Sync] Placements:', {
+    totalSegments: placements.length,
+    adjustedSegments: adjustedCount,
+    totalDuration: renderedBuffer.duration,
+    placements: placements.map((p) => ({
+      id: p.segmentId,
+      start: p.start.toFixed(2),
+      end: p.end.toFixed(2),
+      rate: p.playbackRate.toFixed(2),
+      adjusted: p.adjusted,
+    })),
+  });
 
   return {
     audioUrl,

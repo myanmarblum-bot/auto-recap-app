@@ -100,7 +100,6 @@ export async function removeVocals(
   clearInterval(progressInterval);
   onProgress?.(92);
 
-  // Wait for the recorder to flush all remaining data
   if (recorder.state !== 'inactive') {
     recorder.stop();
   }
@@ -153,10 +152,13 @@ export interface ExportResult {
  * Mixes the cleaned background audio with the generated AI voice audio,
  * then combines with the video to produce a final video file.
  *
- * Uses canvas + MediaRecorder to capture video frames while playing
- * the mixed audio track. The output container is determined by what
- * MediaRecorder supports — we do NOT force a .mp4 extension on a WebM
- * container, which is what caused the previous corruption.
+ * The audio mix is pre-rendered using OfflineAudioContext (fast, not
+ * real-time) and then played back as a single audio element during
+ * video frame capture. This ensures:
+ * 1. The audio is complete and correct before video capture starts
+ * 2. The video plays to its full duration (the 'ended' event is the
+ *    only stop signal — no premature timeouts)
+ * 3. Audio and video stay in sync because there's only one audio source
  */
 export async function exportFinalVideo(opts: ExportOptions): Promise<ExportResult> {
   const { videoUrl, cleanedAudioUrl, aiVoiceUrl, onProgress } = opts;
@@ -175,7 +177,6 @@ export async function exportFinalVideo(opts: ExportOptions): Promise<ExportResul
     video.addEventListener('error', () => reject(new Error('Failed to load video for export.')), { once: true });
   });
 
-  // Ensure we can actually read frames
   if (!video.videoWidth || !video.videoHeight) {
     throw new Error('Video has no visual track — cannot export frames.');
   }
@@ -188,67 +189,49 @@ export async function exportFinalVideo(opts: ExportOptions): Promise<ExportResul
   const width = video.videoWidth;
   const height = video.videoHeight;
 
+  console.log('[Export] Video dimensions:', width, 'x', height, 'duration:', durationSec);
+
   onProgress?.(8);
 
-  // ── 2. Set up canvas for video frame capture ──
+  // ── 2. Pre-render the mixed audio offline ──
+  // This decodes both audio sources, mixes them, and encodes to WAV
+  // all offline (faster than real-time, no playback desync risk)
+  const mixedAudioUrl = await mixAudioOffline({
+    cleanedAudioUrl,
+    aiVoiceUrl,
+    targetDurationSec: durationSec,
+  });
+
+  onProgress?.(25);
+
+  // ── 3. Set up canvas for video frame capture ──
   const canvas = document.createElement('canvas');
   canvas.width = width;
   canvas.height = height;
   const ctx = canvas.getContext('2d');
   if (!ctx) throw new Error('Canvas 2D context not available.');
-
-  // Draw a first frame so the canvas stream has valid video from the start
   ctx.fillRect(0, 0, width, height);
 
-  onProgress?.(12);
-
-  // ── 3. Set up audio mixing graph ──
+  // ── 4. Set up the mixed audio as a single element ──
   const AudioContextClass = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
   const audioCtx = new AudioContextClass();
 
-  // Background audio element (cleaned vocals or original)
-  const videoAudioEl = document.createElement('video');
-  videoAudioEl.src = cleanedAudioUrl ?? videoUrl;
-  videoAudioEl.crossOrigin = 'anonymous';
-  videoAudioEl.muted = false;
+  const mixedAudioEl = document.createElement('audio');
+  mixedAudioEl.src = mixedAudioUrl;
+  mixedAudioEl.crossOrigin = 'anonymous';
 
   await new Promise<void>((resolve, reject) => {
-    videoAudioEl.addEventListener('loadedmetadata', () => resolve(), { once: true });
-    videoAudioEl.addEventListener('error', () => reject(new Error('Failed to load background audio.')), { once: true });
+    mixedAudioEl.addEventListener('loadedmetadata', () => resolve(), { once: true });
+    mixedAudioEl.addEventListener('error', () => reject(new Error('Failed to load mixed audio for playback.')), { once: true });
   });
 
-  const videoAudioSource = audioCtx.createMediaElementSource(videoAudioEl);
-
-  // AI voice audio element
-  const aiVoiceEl = document.createElement('audio');
-  aiVoiceEl.src = aiVoiceUrl;
-  aiVoiceEl.crossOrigin = 'anonymous';
-
-  await new Promise<void>((resolve, reject) => {
-    aiVoiceEl.addEventListener('loadedmetadata', () => resolve(), { once: true });
-    aiVoiceEl.addEventListener('error', () => reject(new Error('Failed to load AI voice audio.')), { once: true });
-  });
-
-  const aiVoiceSource = audioCtx.createMediaElementSource(aiVoiceEl);
-
-  const bgGain = audioCtx.createGain();
-  bgGain.gain.value = 1.0;
-  const voiceGain = audioCtx.createGain();
-  voiceGain.gain.value = 1.0;
-
-  videoAudioSource.connect(bgGain);
-  aiVoiceSource.connect(voiceGain);
-
-  const mixer = audioCtx.createGain();
-  bgGain.connect(mixer);
-  voiceGain.connect(mixer);
-
+  const mixedAudioSource = audioCtx.createMediaElementSource(mixedAudioEl);
   const destination = audioCtx.createMediaStreamDestination();
-  mixer.connect(destination);
+  mixedAudioSource.connect(destination);
 
-  onProgress?.(18);
+  onProgress?.(30);
 
-  // ── 4. Combine canvas video stream + mixed audio stream ──
+  // ── 5. Combine canvas video stream + mixed audio stream ──
   const canvasStream = canvas.captureStream(30);
   const mixedAudioTracks = destination.stream.getAudioTracks();
 
@@ -261,7 +244,7 @@ export async function exportFinalVideo(opts: ExportOptions): Promise<ExportResul
     ...mixedAudioTracks,
   ]);
 
-  // ── 5. Pick the best supported MIME type ──
+  // ── 6. Pick the best supported MIME type ──
   const { mimeType, fileExtension } = getBestVideoMimeType();
   console.log('[Export] Using MIME type:', mimeType, 'extension:', fileExtension);
 
@@ -294,17 +277,18 @@ export async function exportFinalVideo(opts: ExportOptions): Promise<ExportResul
     await audioCtx.resume();
   }
 
-  onProgress?.(22);
+  onProgress?.(35);
 
-  // ── 6. Start playback and recording ──
+  // ── 7. Start recording and playback ──
   video.currentTime = 0;
-  videoAudioEl.currentTime = 0;
-  aiVoiceEl.currentTime = 0;
+  mixedAudioEl.currentTime = 0;
 
-  recorder.start(500); // Larger chunk interval for stability
+  recorder.start(500);
 
-  // Start all playback simultaneously
-  await Promise.all([video.play(), videoAudioEl.play(), aiVoiceEl.play()]);
+  // Start video playback (muted — audio comes from the mixed track)
+  await video.play();
+  // Start mixed audio playback simultaneously
+  mixedAudioEl.play().catch((err) => console.warn('[Export] Mixed audio play error:', err));
 
   // Draw video frames to canvas at ~30fps
   let drawFrameId: number = 0;
@@ -319,32 +303,40 @@ export async function exportFinalVideo(opts: ExportOptions): Promise<ExportResul
   };
   drawFrameId = requestAnimationFrame(drawFrame);
 
-  // Progress tracking
+  // Progress tracking — based on video.currentTime, the source of truth
   const progressInterval = setInterval(() => {
-    if (durationSec > 0) {
-      const pct = 25 + Math.min((video.currentTime / durationSec) * 60, 60);
+    if (durationSec > 0 && video.currentTime > 0) {
+      const pct = 35 + Math.min((video.currentTime / durationSec) * 55, 55);
       onProgress?.(Math.round(pct));
     }
   }, 250);
 
-  // ── 7. Wait for the video to finish playing ──
+  // ── 8. Wait for the video to finish playing ──
+  // The video 'ended' event is the ONLY stop signal.
+  // The safety timeout is 3x the duration to handle any playback stalling,
+  // but it will NOT fire before 'ended' under normal conditions.
   await new Promise<void>((resolve) => {
-    const onEnded = () => resolve();
-    video.addEventListener('ended', onEnded, { once: true });
-    // Safety timeout in case 'ended' never fires
-    setTimeout(() => resolve(), (durationSec + 5) * 1000);
+    let resolved = false;
+    const finish = () => {
+      if (resolved) return;
+      resolved = true;
+      resolve();
+    };
+    video.addEventListener('ended', finish, { once: true });
+    // Safety: 3x duration + 10s buffer. This is long enough that 'ended'
+    // will always fire first under normal playback.
+    setTimeout(finish, (durationSec * 3 + 10) * 1000);
   });
 
   cancelAnimationFrame(drawFrameId);
   clearInterval(progressInterval);
 
-  // Draw one final frame to make sure the last frame is captured
+  // Draw the final frame
   ctx.drawImage(video, 0, 0, width, height);
 
-  onProgress?.(88);
+  onProgress?.(92);
 
-  // ── 8. Flush: request final data, then stop recorder ──
-  // Give the recorder a moment to process remaining frames
+  // ── 9. Flush: request final data, then stop recorder ──
   await new Promise((r) => setTimeout(r, 500));
 
   if (recorder.state !== 'inactive') {
@@ -355,44 +347,37 @@ export async function exportFinalVideo(opts: ExportOptions): Promise<ExportResul
 
   const blob = await recordingComplete;
 
-  onProgress?.(94);
+  onProgress?.(95);
 
-  // ── 9. Validate the blob before returning ──
+  // ── 10. Validate the blob ──
   if (blob.size === 0) {
     throw new Error('Export produced an empty file (0 bytes). Recording may have failed.');
   }
 
-  // A valid video should be at least ~50KB for a few seconds
   const minSize = 50_000;
   if (blob.size < minSize) {
     console.warn('[Export] Blob size suspiciously small:', blob.size, 'bytes');
   }
 
-  // Verify duration by loading the blob back
+  // Verify duration
   const url = URL.createObjectURL(blob);
   const verifiedDuration = await verifyVideoDuration(url);
 
   // Cleanup
   video.pause();
-  videoAudioEl.pause();
-  aiVoiceEl.pause();
+  mixedAudioEl.pause();
   video.removeAttribute('src');
-  videoAudioEl.removeAttribute('src');
-  aiVoiceEl.removeAttribute('src');
+  mixedAudioEl.removeAttribute('src');
+  URL.revokeObjectURL(mixedAudioUrl);
   try { audioCtx.close(); } catch { /* already closed */ }
 
   onProgress?.(100);
 
-  if (verifiedDuration <= 0) {
-    // The blob exists but duration couldn't be read — still return it
-    // but log a warning. Some WebM blobs need seeking before duration is available.
-    console.warn('[Export] Could not verify duration, but blob is non-empty:', blob.size, 'bytes');
-  }
-
-  console.log('[Export] Final blob:', {
+  console.log('[Export] Final result:', {
     size: blob.size,
     type: blob.type,
-    duration: verifiedDuration,
+    expectedDuration: durationSec,
+    verifiedDuration,
   });
 
   return {
@@ -403,6 +388,147 @@ export async function exportFinalVideo(opts: ExportOptions): Promise<ExportResul
     mimeType,
     fileExtension,
   };
+}
+
+/**
+ * Pre-renders the mixed audio (background + AI voice) offline using
+ * OfflineAudioContext. This is faster than real-time and eliminates
+ * the desync risk of playing multiple audio elements simultaneously.
+ *
+ * The output is a WAV blob at the target duration.
+ */
+async function mixAudioOffline(opts: {
+  cleanedAudioUrl: string | null;
+  aiVoiceUrl: string;
+  targetDurationSec: number;
+}): Promise<string> {
+  const { cleanedAudioUrl, aiVoiceUrl, targetDurationSec } = opts;
+
+  const sampleRate = 44100;
+  const numChannels = 2;
+  const lengthInSamples = Math.ceil(targetDurationSec * sampleRate);
+
+  const OfflineAudioContextClass =
+    window.OfflineAudioContext ||
+    (window as unknown as { webkitOfflineAudioContext: typeof OfflineAudioContext }).webkitOfflineAudioContext;
+
+  const offlineCtx = new OfflineAudioContextClass(numChannels, lengthInSamples, sampleRate);
+
+  // Decode and place background audio (cleaned vocals or original video audio)
+  if (cleanedAudioUrl) {
+    try {
+      const bgBuffer = await fetchAndDecodeAudio(offlineCtx, cleanedAudioUrl);
+      const bgSource = offlineCtx.createBufferSource();
+      bgSource.buffer = bgBuffer;
+      const bgGain = offlineCtx.createGain();
+      bgGain.gain.value = 1.0;
+      bgSource.connect(bgGain);
+      bgGain.connect(offlineCtx.destination);
+      bgSource.start(0);
+      console.log('[Export-Mix] Background audio placed, duration:', bgBuffer.duration);
+    } catch (err) {
+      console.warn('[Export-Mix] Failed to decode background audio, skipping:', err);
+    }
+  }
+
+  // Decode and place AI voice audio
+  try {
+    const voiceBuffer = await fetchAndDecodeAudio(offlineCtx, aiVoiceUrl);
+    const voiceSource = offlineCtx.createBufferSource();
+    voiceSource.buffer = voiceBuffer;
+    const voiceGain = offlineCtx.createGain();
+    voiceGain.gain.value = 1.0;
+    voiceSource.connect(voiceGain);
+    voiceGain.connect(offlineCtx.destination);
+    voiceSource.start(0);
+    console.log('[Export-Mix] AI voice audio placed, duration:', voiceBuffer.duration);
+  } catch (err) {
+    console.warn('[Export-Mix] Failed to decode AI voice audio:', err);
+  }
+
+  // Render the mix offline
+  const renderedBuffer = await offlineCtx.startRendering();
+  console.log('[Export-Mix] Rendered mix duration:', renderedBuffer.duration);
+
+  // Encode to WAV
+  const wavBlob = audioBufferToWav(renderedBuffer);
+  return URL.createObjectURL(wavBlob);
+}
+
+/**
+ * Fetches an audio URL and decodes it into an AudioBuffer using the
+ * provided AudioContext.
+ */
+async function fetchAndDecodeAudio(
+  ctx: BaseAudioContext,
+  url: string
+): Promise<AudioBuffer> {
+  const response = await fetch(url);
+  if (!response.ok) {
+    throw new Error(`Failed to fetch audio: ${response.status}`);
+  }
+  const arrayBuffer = await response.arrayBuffer();
+  if (arrayBuffer.byteLength === 0) {
+    throw new Error('Fetched audio is empty (0 bytes)');
+  }
+  return await ctx.decodeAudioData(arrayBuffer);
+}
+
+/**
+ * Encodes an AudioBuffer to a WAV blob (16-bit PCM).
+ */
+function audioBufferToWav(buffer: AudioBuffer): Blob {
+  const numChannels = buffer.numberOfChannels;
+  const sampleRate = buffer.sampleRate;
+  const format = 1;
+  const bitDepth = 16;
+
+  const numSamples = buffer.length;
+  const dataSize = numSamples * numChannels * (bitDepth / 8);
+  const headerSize = 44;
+  const totalSize = headerSize + dataSize;
+
+  const arrayBuffer = new ArrayBuffer(totalSize);
+  const view = new DataView(arrayBuffer);
+
+  writeString(view, 0, 'RIFF');
+  view.setUint32(4, totalSize - 8, true);
+  writeString(view, 8, 'WAVE');
+
+  writeString(view, 12, 'fmt ');
+  view.setUint32(16, 16, true);
+  view.setUint16(20, format, true);
+  view.setUint16(22, numChannels, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * numChannels * (bitDepth / 8), true);
+  view.setUint16(32, numChannels * (bitDepth / 8), true);
+  view.setUint16(34, bitDepth, true);
+
+  writeString(view, 36, 'data');
+  view.setUint32(40, dataSize, true);
+
+  const channels: Float32Array[] = [];
+  for (let ch = 0; ch < numChannels; ch++) {
+    channels.push(buffer.getChannelData(ch));
+  }
+
+  let offset = 44;
+  for (let i = 0; i < numSamples; i++) {
+    for (let ch = 0; ch < numChannels; ch++) {
+      const sample = Math.max(-1, Math.min(1, channels[ch][i]));
+      const intSample = sample < 0 ? sample * 0x8000 : sample * 0x7fff;
+      view.setInt16(offset, intSample, true);
+      offset += 2;
+    }
+  }
+
+  return new Blob([arrayBuffer], { type: 'audio/wav' });
+}
+
+function writeString(view: DataView, offset: number, str: string): void {
+  for (let i = 0; i < str.length; i++) {
+    view.setUint8(offset + i, str.charCodeAt(i));
+  }
 }
 
 /**
@@ -431,7 +557,6 @@ function verifyVideoDuration(url: string): Promise<number> {
       resolve(0);
     }, { once: true });
 
-    // Safety timeout
     setTimeout(() => {
       cleanup();
       resolve(0);
@@ -462,6 +587,5 @@ function getBestVideoMimeType(): { mimeType: string; fileExtension: string } {
     }
   }
 
-  // Fallback — let the browser choose, assume WebM
   return { mimeType: 'video/webm', fileExtension: 'webm' };
 }
